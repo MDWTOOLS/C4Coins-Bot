@@ -16,9 +16,8 @@ CONFIG_FILE = DATA_DIR / "config.json"
 STATS_FILE = DATA_DIR / "stats.json"
 DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("c4coins")
-log.setLevel(logging.DEBUG)
 
 # ============================================================
 # STATE
@@ -82,8 +81,7 @@ class State:
             self.logs.append({"time": ts, "msg": msg, "level": level})
             if len(self.logs) > self.max_logs:
                 self.logs = self.logs[-self.max_logs:]
-        lm = {"debug": logging.DEBUG, "info": logging.INFO, "warn": logging.WARNING, "error": logging.ERROR}
-        log.log(lm.get(level, logging.INFO), msg)
+        log.info("[%s] %s", level.upper(), msg)
 
     def set_status(self, s):
         with self._lock:
@@ -131,39 +129,67 @@ class State:
 S = State()
 
 # ============================================================
-# HELPERS
+# HTTP HELPERS
 # ============================================================
 
-def make_sess(cookie_str, ua):
-    """Create a requests.Session with proper cookie jar."""
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": ua,
+def _headers(referer):
+    """Build request headers with cookie string."""
+    return {
+        "User-Agent": S.ua,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-    })
-    adapter = requests.adapters.HTTPAdapter(max_retries=3, pool_connections=5, pool_maxsize=5)
-    sess.mount("https://", adapter)
-    sess.mount("http://", adapter)
-    # Parse cookie string into jar
-    if cookie_str:
-        for part in cookie_str.split("; "):
-            if "=" in part:
-                name, val = part.split("=", 1)
-                sess.cookies.set(name.strip(), val.strip(), domain="feyorra.top")
-    return sess
+        "Referer": referer,
+        "Cookie": S.cookie,
+    }
 
-def solve_captcha(data):
-    """Solve captcha image using voting mechanism with multiple OCR passes."""
+def _post_headers(referer):
+    h = _headers(referer)
+    h["Origin"] = BASE_URL
+    h["Content-Type"] = "application/x-www-form-urlencoded"
+    return h
+
+def get_page(url, referer, timeout=30):
+    """GET a page, return (text, is_ok, reason). is_ok: True=ok, False=expired, None=network error."""
+    try:
+        r = requests.get(url, headers=_headers(referer), timeout=timeout, allow_redirects=False)
+        if r.status_code in (301, 302, 307, 308):
+            loc = r.headers.get("Location", "")
+            # Any redirect away from expected path = session expired
+            if "/login" in loc or loc.endswith(BASE_URL + "/"):
+                return None, False, "Session expired (redirect ke %s)" % loc
+            # Follow redirect once (some pages do 307 -> self)
+            target = loc if loc.startswith("http") else BASE_URL + loc
+            r2 = requests.get(target, headers=_headers(referer), timeout=timeout, allow_redirects=False)
+            if r2.status_code in (301, 302, 307, 308):
+                return None, False, "Session expired (double redirect)"
+            if r2.status_code != 200:
+                return None, False, "HTTP %d" % r2.status_code
+            return r2.text, True, "OK"
+        if r.status_code != 200:
+            return None, False, "HTTP %d" % r.status_code
+        return r.text, True, "OK"
+    except requests.Timeout:
+        return None, None, "Timeout"
+    except requests.ConnectionError:
+        return None, None, "Connection lost"
+    except requests.RequestException as e:
+        return None, None, str(e)[:80]
+
+# ============================================================
+# CAPTCHA SOLVER
+# ============================================================
+
+def _solve_captcha(data):
+    """Solve captcha using voting across 24+ OCR passes. Returns (digits, confidence)."""
     if len(data) < 50:
-        return None
+        return None, 0
     img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
-        return None
+        return None, 0
     g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     all_results = []
 
-    # Strategy 1: Full-image OCR with various binary thresholds
+    # Strategy 1: Full-image OCR with binary thresholds
     for th in [80, 100, 127, 150]:
         _, binary = cv2.threshold(g, th, 255, cv2.THRESH_BINARY)
         scaled = cv2.resize(binary, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
@@ -175,8 +201,7 @@ def solve_captcha(data):
                 digits = "".join(c for c in txt if c.isdigit())
                 if len(digits) == 4:
                     all_results.append(digits)
-            except:
-                pass
+            except: pass
 
     # Strategy 2: Inverted binary
     for th in [80, 100, 127, 150]:
@@ -190,10 +215,9 @@ def solve_captcha(data):
                 digits = "".join(c for c in txt if c.isdigit())
                 if len(digits) == 4:
                     all_results.append(digits)
-            except:
-                pass
+            except: pass
 
-    # Strategy 3: OTSU + contour-based digit isolation
+    # Strategy 3: Contour-based digit isolation
     try:
         _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         kernel = np.ones((2, 2), np.uint8)
@@ -210,8 +234,7 @@ def solve_captcha(data):
             res = ""
             for x, y, w, h in sel:
                 roi = bw[y:y + h, x:x + w]
-                if roi.size == 0:
-                    continue
+                if roi.size == 0: continue
                 if roi.mean() < 127:
                     roi = cv2.bitwise_not(roi)
                 roi = cv2.copyMakeBorder(roi, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=0)
@@ -222,106 +245,70 @@ def solve_captcha(data):
                     res += txt
                 elif any(c.isdigit() for c in txt):
                     res += "".join(c for c in txt if c.isdigit())
-                if len(res) >= 4:
-                    break
+                if len(res) >= 4: break
             if len(res) >= 4:
                 all_results.append(res[:4])
-    except:
-        pass
+    except: pass
 
     if not all_results:
-        return None
-
+        return None, 0
     votes = Counter(all_results)
     best, count = votes.most_common(1)[0]
-    # Only accept if at least 2 votes or only 1 unique result
-    if count >= 2 or len(votes) == 1:
-        return best
-    # If weak consensus, try most common anyway
-    return best
+    return best, count
+
+# Shorthand that returns just the digits (for compatibility)
+def solve_captcha(data):
+    digits, confidence = _solve_captcha(data)
+    return digits
+
+# Full solver with confidence
+def solve_captcha_confident(data, min_votes=2):
+    """Solve captcha, only return result if confidence >= min_votes."""
+    digits, confidence = _solve_captcha(data)
+    if digits and confidence >= min_votes:
+        return digits
+    return None
+
+# ============================================================
+# PARSERS
+# ============================================================
 
 def parse_balance(html):
     """Extract balance from dashboard page."""
-    # Try multiple patterns
-    patterns = [
-        r"(?:Balance|Earnings?|Available)[^<]*<[^>]*>([\d.]+)\s*(?:Coins?|FEY|USD)?",
-        r"<p[^>]*>\s*([\d.]+)\s*Coins?\s*</p>",
-        r"class=\"[^\"]*balance[^\"]*\"[^>]*>\s*([\d.]+)",
-        r"([\d.]+)\s*(?:Coins?|FEY)\s*",
-    ]
-    for p in patterns:
+    for p in [r"<p>([\d.]+\s*Coins?)</p>",
+              r">\s*([\d.]+)\s*Coins?\s*<",
+              r"(?:Balance|Available|Earnings?)[^\d]{0,30}([\d.]+)",
+              r"([\d.]+)\s*(?:Coins?|FEY|USD)"]:
         m = re.search(p, html, re.I)
         if m:
-            val = m.group(1)
+            val = m.group(1).strip()
             try:
                 float(val)
-                return val + " Coins"
-            except:
-                pass
+                return val
+            except: pass
+    # Fallback: find any number followed by "Coins"
+    all_m = re.findall(r"([\d.]+)\s*Coins?", html, re.I)
+    for m in all_m:
+        try:
+            v = float(m)
+            if v > 0:
+                return m + " Coins"
+        except: pass
     return None
 
 def parse_wait(html):
     m = re.search(r"let wait = (\d+)", html)
     return int(m.group(1)) if m else None
 
-def is_session_valid(sess):
-    """Check if session is still valid by loading dashboard."""
-    try:
-        r = sess.get(BASE_URL + "/dashboard", timeout=30,
-                      headers={"Referer": BASE_URL + "/"})
-        if r.status_code == 307 or r.url.rstrip("/") != BASE_URL.rstrip("/"):
-            return False, "Session expired (redirect)"
-        if "dashboard" not in r.text.lower() and "login" in r.text.lower():
-            return False, "Session expired (login page)"
-        if r.status_code != 200:
-            return False, "HTTP %d" % r.status_code
-        bal = parse_balance(r.text)
-        if bal:
-            S.balance = bal
-        return True, "OK"
-    except requests.Timeout:
-        return None, "Timeout"
-    except requests.RequestException as e:
-        return None, str(e)[:80]
-
-def pick_a_box(sess):
-    """Play pick-a-box game for bonus coins."""
-    S.add_log("Memulai Pick-a-Box game...", "info")
-    for rnd in range(1, 6):
-        if not S.running:
-            break
-        try:
-            pg = sess.get(BASE_URL + "/pickabox", timeout=30,
-                          headers={"Referer": BASE_URL + "/dashboard"})
-            csrf = re.search(r'name="csrf_token_name" value="([^"]+)"', pg.text)
-            tok = re.search(r'name="token" value="([^"]+)"', pg.text)
-            grd = re.search(r'name="game_guard" value="([^"]+)"', pg.text)
-            if not all([csrf, tok, grd]):
-                S.add_log("Pick-a-Box: form parse gagal", "debug")
-                break
-            sess.post(BASE_URL + "/pickabox/play",
-                      data={"csrf_token_name": csrf.group(1), "token": tok.group(1),
-                            "game_guard": grd.group(1), "bet_amount": 1,
-                            "selected_box": random.randint(1, 3)},
-                      headers={"Referer": BASE_URL + "/pickabox",
-                               "Origin": BASE_URL,
-                               "Content-Type": "application/x-www-form-urlencoded"},
-                      timeout=30)
-            S.add_log("Pick-a-Box round %d/5" % rnd, "debug")
-            if rnd < 5:
-                time.sleep(2)
-        except:
-            S.add_log("Pick-a-Box error", "warn")
-            break
-    # Update balance
-    try:
-        valid, _ = is_session_valid(sess)
-        if valid:
-            S.add_log("Pick-a-Box selesai | Balance: %s" % S.balance, "info")
-        else:
-            S.add_log("Pick-a-Box selesai", "info")
-    except:
-        S.add_log("Pick-a-Box selesai", "info")
+def parse_form(page):
+    """Extract form fields from faucet page."""
+    csrf = re.search(r'name="csrf_token_name"[^>]*value="([^"]+)"', page)
+    tok = re.search(r'name="token"[^>]*value="([^"]+)"', page)
+    img = re.search(r'<img[^>]*id="Imageid"[^>]*src="([^"]+)"', page)
+    if not img:
+        img = re.search(r'<img[^>]*src="([^"]*captcha[^"]*)"', page, re.I)
+    fld = re.search(r'<input[^>]*type="number"[^>]*name="([^"]+)"', page)
+    return csrf, tok, img, fld
 
 # ============================================================
 # BOT LOOP
@@ -331,8 +318,7 @@ def bot_loop():
     S.add_log("Bot dimulai", "info")
     S.uptime_start = time.time()
     attempt = 0
-    sess = make_sess(S.cookie, S.ua)
-    consecutive_captcha_fail = 0
+    cap_fail_streak = 0
 
     while S.running:
         if S.paused:
@@ -341,59 +327,52 @@ def bot_loop():
         try:
             attempt += 1
 
-            # === CHECK SESSION ===
+            # === STEP 1: CHECK SESSION (dashboard) ===
             S.set_status("Memeriksa session...")
             S.add_log("[Attempt #%d] Memeriksa session..." % attempt, "info")
 
-            valid, reason = is_session_valid(sess)
-            if valid is False:
+            dash, ok, reason = get_page(BASE_URL + "/dashboard", BASE_URL + "/")
+            if ok is False:
                 S.set_status("Session Expired!")
                 S.add_log("SESSION EXPIRED! %s" % reason, "error")
                 S.add_log("Silakan update cookie baru dari feyorra.top", "error")
                 S.running = False
                 break
-            elif valid is None:
+            elif ok is None:
                 S.reconnects += 1
-                S.add_log("Koneksi error: %s - Reconnecting..." % reason, "error")
+                S.add_log("Koneksi gagal: %s - Reconnect..." % reason, "error")
                 S.set_status("Reconnecting...")
                 time.sleep(5)
-                sess = make_sess(S.cookie, S.ua)
                 continue
 
-            S.add_log("Session valid | Balance: %s" % S.balance, "info")
+            bal = parse_balance(dash)
+            if bal:
+                S.balance = bal
+            S.add_log("Session valid | Balance: %s" % (bal or "N/A"), "info")
 
-            # === LOAD FAUCET ===
+            # === STEP 2: LOAD FAUCET ===
             S.set_status("Memuat faucet...")
             S.add_log("Memuat halaman faucet...", "info")
-            try:
-                r = sess.get(BASE_URL + "/faucet", timeout=30,
-                             headers={"Referer": BASE_URL + "/dashboard"})
-                # Check for redirect (session expired mid-session)
-                if r.status_code in [301, 302, 307, 308]:
-                    loc = r.headers.get("Location", "")
-                    S.add_log("Faucet redirect ke %s - session expired!" % loc, "error")
-                    S.set_status("Session Expired!")
-                    S.running = False
-                    break
-                page = r.text
-            except requests.RequestException as e:
-                S.add_log("Gagal muat faucet: %s" % str(e)[:80], "error")
+
+            page, ok, reason = get_page(BASE_URL + "/faucet", BASE_URL + "/dashboard")
+            if ok is False:
+                S.set_status("Session Expired!")
+                S.add_log("Faucet gagal: %s - session expired!" % reason, "error")
+                S.running = False
+                break
+            elif ok is None:
+                S.add_log("Gagal muat faucet: %s" % reason, "error")
                 time.sleep(5)
                 continue
 
-            # Check faucet status
+            # Check status
             if "daily limit" in page.lower() or "limit reached" in page.lower():
                 S.set_status("Daily Limit!")
                 S.add_log("DAILY LIMIT tercapai! Bot berhenti.", "warn")
                 break
-            if "shortlink" in page.lower() and "claim" not in page.lower():
+            if "shortlink" in page.lower() and "Ready To Claim" not in page:
                 S.set_status("Shortlink Required")
                 S.add_log("Shortlink diperlukan! Bot berhenti.", "warn")
-                break
-            if "login" in page.lower() and "dashboard" not in page.lower():
-                S.set_status("Session Expired!")
-                S.add_log("Di-redirect ke login - session expired!", "error")
-                S.running = False
                 break
 
             if "Ready To Claim" not in page:
@@ -402,45 +381,34 @@ def bot_loop():
                     S.set_status("Cooldown %ds" % wait)
                     S.add_log("Faucet belum siap, cooldown %d detik..." % wait, "info")
                     for sec in range(wait):
-                        if not S.running or S.paused:
-                            break
+                        if not S.running or S.paused: break
                         if sec > 0 and sec % 15 == 0:
                             S.add_log("Cooldown: %d/%d detik tersisa" % (wait - sec, wait), "debug")
                         time.sleep(1)
-                    S.add_log("Cooldown selesai, mencoba claim...", "info")
                     continue
                 else:
-                    S.add_log("Faucet tidak ready, reload dalam 10 detik...", "warn")
+                    S.add_log("Faucet belum ready, reload 10 detik...", "warn")
                     time.sleep(10)
                     continue
 
-            # === PARSE FORM ===
+            # === STEP 3: PARSE FORM ===
             S.add_log("Faucet siap! Parsing form...", "info")
-            csrf = re.search(r'name="csrf_token_name"[^>]*value="([^"]+)"', page)
-            tok = re.search(r'name="token"[^>]*value="([^"]+)"', page)
-            img_m = re.search(r'<img[^>]*id="Imageid"[^>]*src="([^"]+)"', page)
-            if not img_m:
-                img_m = re.search(r'<img[^>]*src="([^"]*captcha[^"]*)"', page, re.I)
-            fld = re.search(r'<input[^>]*type="number"[^>]*name="([^"]+)"', page)
-
+            csrf, tok, img_m, fld = parse_form(page)
             if not all([csrf, tok, img_m, fld]):
                 S.add_log("Form parse gagal (csrf=%s token=%s img=%s field=%s)" %
                           ("Y" if csrf else "N", "Y" if tok else "N",
                            "Y" if img_m else "N", "Y" if fld else "N"), "warn")
                 time.sleep(5)
                 continue
+            S.add_log("Form OK", "debug")
 
-            S.add_log("Form OK | CSRF: %s... | Field: %s" %
-                      (csrf.group(1)[:12], fld.group(1)[:16]), "debug")
-
-            # === DOWNLOAD CAPTCHA ===
+            # === STEP 4: DOWNLOAD CAPTCHA ===
             S.set_status("Mengunduh captcha...")
             img_url = img_m.group(1)
             if not img_url.startswith("http"):
                 img_url = BASE_URL + "/" + img_url.lstrip("/")
             try:
-                img_r = sess.get(img_url, timeout=30,
-                                 headers={"Referer": BASE_URL + "/faucet"})
+                img_r = requests.get(img_url, headers=_headers(BASE_URL + "/faucet"), timeout=30)
                 S.add_log("Captcha diunduh (%d bytes)" % len(img_r.content), "debug")
             except requests.RequestException as e:
                 S.add_log("Gagal unduh captcha: %s" % str(e)[:60], "error")
@@ -448,111 +416,111 @@ def bot_loop():
                 continue
 
             if len(img_r.content) < 100:
-                S.add_log("Captcha kosong, bermain Pick-a-Box...", "warn")
-                pick_a_box(sess)
+                S.add_log("Captcha kosong, skip...", "warn")
                 time.sleep(3)
                 continue
 
-            # === SOLVE CAPTCHA ===
+            # === STEP 5: SOLVE CAPTCHA ===
             S.set_status("Memecahkan captcha...")
             S.add_log("Memecahkan captcha (OCR)...", "info")
             t0 = time.time()
-            digits = solve_captcha(img_r.content)
+            digits, confidence = _solve_captcha(img_r.content)
             t1 = time.time() - t0
 
             if not digits:
                 S.cap_fail += 1
-                consecutive_captcha_fail += 1
-                S.add_log("Captcha GAGAL (%.1fs) | Fail streak: %d | Total fail: %d" %
-                          (t1, consecutive_captcha_fail, S.cap_fail), "error")
-                if consecutive_captcha_fail >= 10:
+                cap_fail_streak += 1
+                S.add_log("Captcha GAGAL (%.1fs) | Streak: %d | Total fail: %d" %
+                          (t1, cap_fail_streak, S.cap_fail), "error")
+                if cap_fail_streak >= 10:
                     S.add_log("10x captcha gagal berturut-turut! Bot berhenti.", "error")
                     S.set_status("Captcha Failed")
                     break
                 time.sleep(2)
                 continue
 
+            if confidence < 2:
+                S.add_log("Captcha rendah keyakinan: %s (votes=%d), reload captcha..." % (digits, confidence), "warn")
+                S.cap_fail += 1
+                cap_fail_streak += 1
+                time.sleep(1)
+                continue
+
             S.cap_ok += 1
-            consecutive_captcha_fail = 0
+            cap_fail_streak = 0
             S.add_log("Captcha BERHASIL: %s (%.1fs) | OK: %d | Fail: %d" %
                       (digits, t1, S.cap_ok, S.cap_fail), "info")
 
-            # === SUBMIT CLAIM ===
+            # === STEP 6: SUBMIT CLAIM ===
             S.set_status("Mengirim claim...")
             S.add_log("Mengirim claim...", "info")
-            post_data = {
-                "csrf_token_name": csrf.group(1),
-                "token": tok.group(1),
-                fld.group(1): digits
-            }
             try:
-                cr = sess.post(BASE_URL + "/faucet/verify", data=post_data,
-                               headers={"Referer": BASE_URL + "/faucet",
-                                        "Origin": BASE_URL,
-                                        "Content-Type": "application/x-www-form-urlencoded"},
-                               allow_redirects=False, timeout=30)
-                S.add_log("Claim response: HTTP %d -> %s" %
-                          (cr.status_code, cr.headers.get("Location", "none")), "debug")
+                cr = requests.post(BASE_URL + "/faucet/verify",
+                    data={"csrf_token_name": csrf.group(1), "token": tok.group(1), fld.group(1): digits},
+                    headers=_post_headers(BASE_URL + "/faucet"),
+                    allow_redirects=False, timeout=30)
+                S.add_log("Claim HTTP %d -> %s" % (cr.status_code, cr.headers.get("Location", "none")), "debug")
 
-                if cr.status_code in [301, 302, 307]:
+                if cr.status_code in (301, 302, 307):
                     loc = cr.headers.get("Location", "")
                     if "/login" in loc:
-                        S.add_log("Redirect ke login - session expired!", "error")
+                        S.add_log("Redirect ke login - SESSION EXPIRED!", "error")
                         S.set_status("Session Expired!")
                         S.running = False
                         break
             except requests.RequestException as e:
-                S.add_log("Claim gagal: %s" % str(e)[:60], "error")
+                S.add_log("Claim error: %s" % str(e)[:60], "error")
                 time.sleep(3)
                 continue
 
-            # === CHECK RESULT ===
+            # === STEP 7: CHECK RESULT ===
             time.sleep(2)
             S.set_status("Memeriksa hasil...")
-            try:
-                r2 = sess.get(BASE_URL + "/faucet", timeout=30,
-                              headers={"Referer": BASE_URL + "/faucet/verify"})
-                page2 = r2.text
-            except:
+
+            page2, ok2, reason2 = get_page(BASE_URL + "/faucet", BASE_URL + "/faucet/verify")
+            if ok2 is False:
+                S.add_log("Gagal cek hasil: %s" % reason2, "error")
+                time.sleep(3)
+                continue
+            if not page2:
                 time.sleep(3)
                 continue
 
-            # Check for wait timer (indicates successful claim)
             wait = parse_wait(page2)
             if wait:
-                # Claim succeeded!
-                amt = 0.001  # default
+                # SUCCESS!
+                amt = 0.001
                 amt_m = re.search(r"([\d.]+)\s*Coins?\s*has been added", page2, re.I)
                 if amt_m:
-                    amt = float(amt_m.group(1))
+                    try: amt = float(amt_m.group(1))
+                    except: pass
                 S.record_earned(amt, "Claim berhasil!")
                 S.add_log("CLAIM BERHASIL! +%s coins | Total: %.4f | Claims: %d" %
-                          (("%.4f" % amt), S.total_earned, S.total_claims), "info")
+                          (("%.4f" % amt), S.total_earned, S.total_claims))
 
-                # Update balance
-                try:
-                    valid_b, _ = is_session_valid(sess)
-                except:
-                    pass
+                # Refresh balance
+                dash2, _, _ = get_page(BASE_URL + "/dashboard", BASE_URL + "/faucet")
+                if dash2:
+                    bal2 = parse_balance(dash2)
+                    if bal2:
+                        S.balance = bal2
 
                 # Cooldown
                 S.set_status("Cooldown %ds" % wait)
                 S.add_log("Cooldown %d detik... | Balance: %s" % (wait, S.balance), "info")
                 for sec in range(wait):
-                    if not S.running or S.paused:
-                        break
+                    if not S.running or S.paused: break
                     if sec > 0 and sec % 15 == 0:
                         S.add_log("Cooldown: %d/%d detik tersisa" % (wait - sec, wait), "debug")
                     time.sleep(1)
                 S.add_log("Cooldown selesai, claim berikutnya...", "info")
 
             elif "Ready To Claim" in page2:
-                # Claim failed - captcha was wrong
                 S.total_failed += 1
                 if "incorrect" in page2.lower() or "wrong" in page2.lower():
                     S.add_log("Captcha SALAH! (total salah: %d)" % S.total_failed, "error")
                 else:
-                    S.add_log("Claim gagal, masih Ready To Claim (total gagal: %d)" % S.total_failed, "warn")
+                    S.add_log("Claim gagal, masih Ready To Claim (gagal: %d)" % S.total_failed, "warn")
                 time.sleep(3)
             else:
                 S.add_log("Hasil tidak diketahui, reload...", "warn")
@@ -563,7 +531,6 @@ def bot_loop():
             S.set_status("Reconnecting...")
             S.add_log("Koneksi terputus! Reconnect #%d..." % S.reconnects, "error")
             time.sleep(10)
-            sess = make_sess(S.cookie, S.ua)
         except Exception as e:
             log.error("Loop error: %s", e, exc_info=True)
             S.set_status("Error")
@@ -572,7 +539,7 @@ def bot_loop():
 
     S.set_status("Stopped")
     S.add_log("Bot berhenti | Claims: %d | Earned: %.4f | Failed: %d | Uptime: %s" %
-              (S.total_claims, S.total_earned, S.total_failed, S.uptime), "info")
+              (S.total_claims, S.total_earned, S.total_failed, S.uptime))
 
 # ============================================================
 # FLASK
@@ -600,15 +567,15 @@ def api_logs():
 def api_cookie():
     if request.method == "GET":
         c = S.cookie
-        return jsonify({"has_cookie": bool(c),
-                        "preview": (c[:25] + "...") if c and len(c) > 25 else c or ""})
+        preview = (c[:30] + "...") if c and len(c) > 30 else (c or "")
+        return jsonify({"has_cookie": bool(c), "preview": preview})
     d = request.get_json(force=True, silent=True) or {}
     ck = str(d.get("cookie", "")).strip()
     if not ck:
         return jsonify({"ok": False, "msg": "Cookie wajib diisi"}), 400
     S.cookie = ck
     S.save_cfg()
-    S.add_log("Cookie diperbarui (panjang: %d karakter)" % len(ck), "info")
+    S.add_log("Cookie diperbarui (%d karakter)" % len(ck))
     return jsonify({"ok": True, "msg": "Cookie tersimpan!"})
 
 @app.route("/api/bot/start", methods=["POST"])
@@ -631,7 +598,7 @@ def api_stop():
 def api_pause():
     S.paused = not S.paused
     S.set_status("Paused" if S.paused else "Resumed")
-    S.add_log("Bot %s" % ("dijeda" if S.paused else "dilanjutkan"), "info")
+    S.add_log("Bot %s" % ("dijeda" if S.paused else "dilanjutkan"))
     return jsonify({"ok": True, "paused": S.paused})
 
 @app.route("/api/bot/reset", methods=["POST"])
@@ -649,9 +616,8 @@ def api_reset():
     S.logs.clear()
     S.cookie = ""
     for f in [STATS_FILE, CONFIG_FILE]:
-        if f.exists():
-            f.unlink()
-    S.add_log("Bot direset", "info")
+        if f.exists(): f.unlink()
+    S.add_log("Bot direset")
     return jsonify({"ok": True, "msg": "Bot reset"})
 
 # ============================================================
@@ -669,7 +635,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0b0e14;color:#c9d1d9;min-height:100vh}
 .hdr{background:linear-gradient(135deg,#161b22 0%,#0d1117 100%);border-bottom:1px solid rgba(240,185,11,.15);padding:14px 20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
 .logo{display:flex;align-items:center;gap:12px}
-.logo-icon{width:36px;height:36px;background:linear-gradient(135deg,#f0b90b,#f8d12f);border-radius:10px;display:flex;align-items:center;justify-content:center;color:#0b0e14;font-weight:900;font-size:11px;letter-spacing:-0.5px;text-shadow:0 1px 2px rgba(0,0,0,.2)}
+.logo-icon{width:36px;height:36px;background:linear-gradient(135deg,#f0b90b,#f8d12f);border-radius:10px;display:flex;align-items:center;justify-content:center;color:#0b0e14;font-weight:900;font-size:11px;letter-spacing:-.5px}
 .logo-text h1{font-size:17px;color:#f0f6fc;font-weight:700;line-height:1.2}
 .logo-text span{font-size:10px;color:#484f58;display:block;margin-top:1px}
 .badge{display:inline-flex;align-items:center;gap:6px;padding:5px 14px;border-radius:20px;font-size:11px;font-weight:600;border:1px solid;transition:all .3s}
@@ -684,22 +650,18 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0b0e1
 .b-warn .badge-dot{background:#d29922;animation:pulse 1.5s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .wrap{max-width:900px;margin:0 auto;padding:16px}
-.card{background:#161b22;border:1px solid rgba(240,246,252,.06);border-radius:12px;padding:18px;margin-bottom:14px;transition:border-color .2s}
+.card{background:#161b22;border:1px solid rgba(240,246,252,.06);border-radius:12px;padding:18px;margin-bottom:14px}
 .card:hover{border-color:rgba(240,246,252,.1)}
 .card-title{font-size:11px;font-weight:700;color:#484f58;text-transform:uppercase;letter-spacing:.8px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
-.card-title .icon{font-size:14px}
 .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
-.stat{text-align:center;padding:16px 8px;background:rgba(240,246,252,.02);border:1px solid rgba(240,246,252,.04);border-radius:10px;transition:all .2s}
-.stat:hover{background:rgba(240,246,252,.04);transform:translateY(-1px)}
+.stat{text-align:center;padding:16px 8px;background:rgba(240,246,252,.02);border:1px solid rgba(240,246,252,.04);border-radius:10px}
 .stat .val{font-size:22px;font-weight:800;line-height:1.2;font-variant-numeric:tabular-nums}
 .stat .lbl{font-size:10px;color:#484f58;margin-top:5px;text-transform:uppercase;letter-spacing:.4px}
-.c-earn .val{color:#f0b90b}.c-claim .val{color:#3fb950}.c-bal .val{color:#58a6ff}.c-up .val{color:#bc8cff}
-.c-fail .val{color:#f85149}
-.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.c-earn .val{color:#f0b90b}.c-claim .val{color:#3fb950}.c-fail .val{color:#f85149}.c-bal .val{color:#58a6ff}
 .form-row{display:flex;gap:10px;align-items:flex-end}
 .form-group{flex:1}
 .form-group label{display:block;font-size:11px;color:#484f58;margin-bottom:5px;font-weight:600}
-.form-group textarea{width:100%;padding:10px 12px;background:#0d1117;border:1px solid rgba(240,246,252,.1);border-radius:8px;color:#c9d1d9;font-size:11px;outline:none;font-family:'Courier New',monospace;resize:vertical;min-height:36px;max-height:80px;transition:border .2s}
+.form-group textarea{width:100%;padding:10px 12px;background:#0d1117;border:1px solid rgba(240,246,252,.1);border-radius:8px;color:#c9d1d9;font-size:11px;outline:none;font-family:'Courier New',monospace;resize:vertical;min-height:42px;max-height:120px;transition:border .2s;line-height:1.4}
 .form-group textarea:focus{border-color:#f0b90b}
 .form-group textarea::placeholder{color:#30363d}
 .btn{padding:10px 18px;border:none;border-radius:8px;font-size:12px;font-weight:700;cursor:pointer;transition:all .15s;display:inline-flex;align-items:center;gap:6px;letter-spacing:.3px;white-space:nowrap}
@@ -716,7 +678,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0b0e1
 .btn-save{background:linear-gradient(135deg,#1f6feb,#388bfd);color:#fff}
 .btn-save:hover{box-shadow:0 4px 12px rgba(56,139,253,.3)}
 .btns{display:flex;gap:8px;flex-wrap:wrap}
-.cookie-info{margin-top:10px;padding:8px 12px;border-radius:8px;font-size:11px;font-family:'Courier New',monospace}
+.cookie-info{margin-top:10px;padding:8px 12px;border-radius:8px;font-size:11px;font-family:'Courier New',monospace;word-break:break-all}
 .cookie-ok{background:rgba(46,160,67,.06);border:1px solid rgba(46,160,67,.15);color:#3fb950}
 .cookie-no{background:rgba(248,81,73,.06);border:1px solid rgba(248,81,73,.15);color:#f85149}
 .detail-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:12px}
@@ -727,7 +689,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0b0e1
 .log-box::-webkit-scrollbar-track{background:transparent}
 .log-box::-webkit-scrollbar-thumb{background:rgba(240,246,252,.06);border-radius:3px}
 .log-box::-webkit-scrollbar-thumb:hover{background:rgba(240,246,252,.12)}
-.log-line{display:flex;gap:10px;padding:2px 6px;border-radius:4px;transition:background .15s}
+.log-line{display:flex;gap:10px;padding:2px 6px;border-radius:4px}
 .log-line:hover{background:rgba(240,246,252,.03)}
 .log-ts{color:#30363d;white-space:nowrap;flex-shrink:0;min-width:62px;font-size:10px}
 .log-lv{width:8px;flex-shrink:0;display:flex;align-items:center}
@@ -746,12 +708,9 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0b0e1
 .log-empty{text-align:center;color:#21262d;padding:60px 20px;font-size:12px}
 @media(max-width:640px){
   .grid4{grid-template-columns:repeat(2,1fr)}
-  .grid3{grid-template-columns:1fr}
   .detail-grid{grid-template-columns:1fr 1fr}
-  .wrap{padding:10px}
-  .hdr{padding:10px 14px}
-  .btns{flex-direction:column}
-  .btns .btn{width:100%;justify-content:center}
+  .wrap{padding:10px}.hdr{padding:10px 14px}
+  .btns{flex-direction:column}.btns .btn{width:100%;justify-content:center}
   .form-row{flex-direction:column}
   .log-box{height:300px;font-size:10px}
 }
@@ -774,9 +733,8 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0b0e1
 </div>
 
 <div class="wrap">
-
   <div class="card">
-    <div class="card-title"><span class="icon">&#128200;</span> Statistik</div>
+    <div class="card-title">&#128200; Statistik</div>
     <div class="grid4">
       <div class="stat c-earn"><div class="val" id="sEarned">0.0000</div><div class="lbl">Earned</div></div>
       <div class="stat c-claim"><div class="val" id="sClaims">0</div><div class="lbl">Claims</div></div>
@@ -786,11 +744,11 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0b0e1
   </div>
 
   <div class="card">
-    <div class="card-title"><span class="icon">&#127873;</span> Cookie</div>
+    <div class="card-title">&#127873; Cookie</div>
     <div class="form-row">
       <div class="form-group">
         <label>Cookie dari feyorra.top</label>
-        <textarea id="cookieIn" placeholder="Paste cookie di sini... (ci_session, csrf_cookie_name, dll)" rows="2"></textarea>
+        <textarea id="cookieIn" placeholder="Paste semua cookie dari feyorra.top di sini..."></textarea>
       </div>
       <button class="btn btn-save" onclick="saveCookie()">&#128190; Save</button>
     </div>
@@ -798,7 +756,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0b0e1
   </div>
 
   <div class="card">
-    <div class="card-title"><span class="icon">&#9881;</span> Kontrol</div>
+    <div class="card-title">&#9881; Kontrol</div>
     <div class="btns">
       <button class="btn btn-go" onclick="startBot()">&#9654; Start</button>
       <button class="btn btn-stop" onclick="stopBot()">&#9632; Stop</button>
@@ -808,7 +766,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0b0e1
   </div>
 
   <div class="card">
-    <div class="card-title"><span class="icon">&#128202;</span> Detail</div>
+    <div class="card-title">&#128202; Detail</div>
     <div class="detail-grid">
       <div class="row"><span class="k">Captcha OK</span><span class="v" style="color:#3fb950" id="dCapOk">0</span></div>
       <div class="row"><span class="k">Captcha Fail</span><span class="v" style="color:#f85149" id="dCapFail">0</span></div>
@@ -820,147 +778,97 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0b0e1
   </div>
 
   <div class="card" style="padding-bottom:10px">
-    <div class="card-title"><span class="icon">&#128220;</span> Activity Log</div>
+    <div class="card-title">&#128220; Activity Log</div>
     <div class="log-box" id="logBox"><div class="log-empty">Menunggu aktivitas bot...</div></div>
   </div>
-
 </div>
 
 <script>
-var lastLen = 0;
-var autoScroll = true;
+var lastLen=0,autoScroll=true;
+function api(u,o){return fetch(u,o).then(function(r){return r.json()}).catch(function(e){console.error(e);return null})}
+function esc(s){var d=document.createElement('span');d.textContent=s;return d.innerHTML}
 
-function api(url, opts) {
-  return fetch(url, opts).then(function(r) { return r.json(); }).catch(function(e) { console.error(e); return null; });
-}
-
-function esc(s) {
-  var d = document.createElement('span');
-  d.textContent = s;
-  return d.innerHTML;
-}
-
-function updateStatus() {
-  api('/api/status').then(function(d) {
-    if (!d) return;
-    var badge = document.getElementById('badge');
-    var txt = document.getElementById('badgeTxt');
-    txt.textContent = d.status;
-    var sl = d.status.toLowerCase();
-    if (d.running && !d.paused) badge.className = 'badge b-on';
-    else if (d.paused) badge.className = 'badge b-warn';
-    else if (sl.indexOf('error') >= 0 || sl.indexOf('expired') >= 0 || sl.indexOf('fail') >= 0) badge.className = 'badge b-err';
-    else badge.className = 'badge b-off';
-
-    document.getElementById('sEarned').textContent = d.earned.toFixed(4);
-    document.getElementById('sClaims').textContent = d.claims;
-    document.getElementById('sFailed').textContent = d.failed || 0;
-    document.getElementById('sBal').textContent = d.balance;
-    document.getElementById('dCapOk').textContent = d.cap_ok;
-    document.getElementById('dCapFail').textContent = d.cap_fail;
-    document.getElementById('dReconn').textContent = d.reconnects;
-    document.getElementById('dLastClaim').textContent = d.last_time || '-';
-    document.getElementById('dLastReward').textContent = d.last_msg || '-';
-    document.getElementById('dUptime').textContent = d.uptime;
+function updateStatus(){
+  api('/api/status').then(function(d){
+    if(!d)return;
+    var b=document.getElementById('badge'),t=document.getElementById('badgeTxt');
+    t.textContent=d.status;
+    var s=d.status.toLowerCase();
+    if(d.running&&!d.paused)b.className='badge b-on';
+    else if(d.paused)b.className='badge b-warn';
+    else if(s.indexOf('error')>=0||s.indexOf('expired')>=0||s.indexOf('fail')>=0)b.className='badge b-err';
+    else b.className='badge b-off';
+    document.getElementById('sEarned').textContent=d.earned.toFixed(4);
+    document.getElementById('sClaims').textContent=d.claims;
+    document.getElementById('sFailed').textContent=d.failed||0;
+    document.getElementById('sBal').textContent=d.balance;
+    document.getElementById('dCapOk').textContent=d.cap_ok;
+    document.getElementById('dCapFail').textContent=d.cap_fail;
+    document.getElementById('dReconn').textContent=d.reconnects;
+    document.getElementById('dLastClaim').textContent=d.last_time||'-';
+    document.getElementById('dLastReward').textContent=d.last_msg||'-';
+    document.getElementById('dUptime').textContent=d.uptime;
   });
 }
 
-function classifyMsg(msg) {
-  var m = msg.toLowerCase();
-  if (m.indexOf('berhasil') >= 0 || m.indexOf('success') >= 0 || m.indexOf('+') === 0) return 'success';
-  if (m.indexOf('gagal') >= 0 || m.indexOf('error') >= 0 || m.indexOf('expired') >= 0 || m.indexOf('salah') >= 0 || m.indexOf('terputus') >= 0) return 'error';
-  if (m.indexOf('cooldown') >= 0 || m.indexOf('limit') >= 0 || m.indexOf('shortlink') >= 0) return 'warn';
-  return 'info';
-}
-
-function updateLogs() {
-  api('/api/logs').then(function(logs) {
-    if (!logs || !logs.length) return;
-    if (logs.length === lastLen) return;
-    lastLen = logs.length;
-    var box = document.getElementById('logBox');
-    var html = '';
-    for (var i = 0; i < logs.length; i++) {
-      var l = logs[i];
-      var cls = l.level || 'info';
-      // Auto-classify success messages
-      if (cls === 'info' && (l.msg.indexOf('BERHASIL') >= 0 || l.msg.indexOf('selesai') >= 0)) cls = 'success';
-      if (cls === 'info' && l.msg.charAt(0) === '+') cls = 'success';
-      html += '<div class="log-line">';
-      html += '<span class="log-ts">' + esc(l.time) + '</span>';
-      html += '<span class="log-lv"><span class="log-lv-dot ' + cls + '"></span></span>';
-      html += '<span class="log-msg ' + cls + '">' + esc(l.msg) + '</span>';
-      html += '</div>';
+function updateLogs(){
+  api('/api/logs').then(function(logs){
+    if(!logs||!logs.length)return;
+    if(logs.length===lastLen)return;
+    lastLen=logs.length;
+    var box=document.getElementById('logBox'),html='';
+    for(var i=0;i<logs.length;i++){
+      var l=logs[i],cls=l.level||'info';
+      if(cls==='info'&&(l.msg.indexOf('BERHASIL')>=0||l.msg.indexOf('selesai')>=0))cls='success';
+      if(cls==='info'&&l.msg.charAt(0)==='+')cls='success';
+      html+='<div class="log-line">';
+      html+='<span class="log-ts">'+esc(l.time)+'</span>';
+      html+='<span class="log-lv"><span class="log-lv-dot '+cls+'"></span></span>';
+      html+='<span class="log-msg '+cls+'">'+esc(l.msg)+'</span>';
+      html+='</div>';
     }
-    box.innerHTML = html;
-    if (autoScroll) box.scrollTop = box.scrollHeight;
+    box.innerHTML=html;
+    if(autoScroll)box.scrollTop=box.scrollHeight;
   });
 }
 
-// Disable auto-scroll when user scrolls up
-document.addEventListener('DOMContentLoaded', function() {
-  var box = document.getElementById('logBox');
-  box.addEventListener('scroll', function() {
-    autoScroll = (box.scrollHeight - box.scrollTop - box.clientHeight) < 50;
-  });
+document.addEventListener('DOMContentLoaded',function(){
+  var box=document.getElementById('logBox');
+  box.addEventListener('scroll',function(){autoScroll=(box.scrollHeight-box.scrollTop-box.clientHeight)<50});
 });
 
-function loadCookie() {
-  api('/api/cookie').then(function(d) {
-    if (!d) return;
-    var el = document.getElementById('cookieInfo');
-    if (d.has_cookie) {
-      el.className = 'cookie-info cookie-ok';
-      el.textContent = 'Cookie aktif: ' + d.preview;
-    } else {
-      el.className = 'cookie-info cookie-no';
-      el.textContent = 'Cookie belum di-set! Paste cookie dari feyorra.top.';
+function loadCookie(){
+  api('/api/cookie').then(function(d){
+    if(!d)return;
+    var el=document.getElementById('cookieInfo');
+    if(d.has_cookie){
+      el.className='cookie-info cookie-ok';
+      el.textContent='Cookie aktif: '+d.preview;
+    }else{
+      el.className='cookie-info cookie-no';
+      el.textContent='Cookie belum di-set! Paste cookie dari feyorra.top.';
     }
   });
 }
 
-function saveCookie() {
-  var v = document.getElementById('cookieIn').value.trim();
-  if (!v) { alert('Cookie wajib diisi!'); return; }
-  api('/api/cookie', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({cookie: v})
-  }).then(function(d) {
-    if (d && d.ok) {
-      document.getElementById('cookieIn').value = '';
-      loadCookie();
-      alert('Cookie tersimpan! Klik Start untuk menjalankan bot.');
-    } else {
-      alert(d ? d.msg : 'Gagal menyimpan cookie');
-    }
+function saveCookie(){
+  var v=document.getElementById('cookieIn').value.trim();
+  if(!v){alert('Cookie wajib diisi!');return}
+  api('/api/cookie',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie:v})})
+  .then(function(d){
+    if(d&&d.ok){document.getElementById('cookieIn').value='';loadCookie();alert('Cookie tersimpan! Klik Start.')}
+    else alert(d?d.msg:'Gagal menyimpan cookie');
   });
 }
 
-function startBot() {
-  api('/api/bot/start', {method: 'POST'}).then(function(d) {
-    if (d && !d.ok) alert(d.msg);
-  });
-}
+function startBot(){api('/api/bot/start',{method:'POST'}).then(function(d){if(d&&!d.ok)alert(d.msg)})}
+function stopBot(){api('/api/bot/stop',{method:'POST'})}
+function pauseBot(){api('/api/bot/pause',{method:'POST'})}
+function resetBot(){if(!confirm('Reset semua data?'))return;api('/api/bot/reset',{method:'POST'}).then(function(){loadCookie()})}
 
-function stopBot() {
-  api('/api/bot/stop', {method: 'POST'});
-}
-
-function pauseBot() {
-  api('/api/bot/pause', {method: 'POST'});
-}
-
-function resetBot() {
-  if (!confirm('Reset semua data dan cookie?')) return;
-  api('/api/bot/reset', {method: 'POST'}).then(function() { loadCookie(); });
-}
-
-setInterval(updateStatus, 1500);
-setInterval(updateLogs, 1500);
-updateStatus();
-updateLogs();
-loadCookie();
+setInterval(updateStatus,1500);
+setInterval(updateLogs,1500);
+updateStatus();updateLogs();loadCookie();
 </script>
 </body>
 </html>"""
