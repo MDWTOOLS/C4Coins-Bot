@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>C4Coins Faucet Bot</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🪙</text></svg>">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0b0d14;color:#c8cdd8;min-height:100vh}
+.header{background:linear-gradient(135deg,#0f1420,#141b2d);border-bottom:1px solid rgba(255,255,255,.06);padding:16px 24px;display:flex;align-items:center;justify-content:space-between}
+.logo{display:flex;align-items:center;gap:12px}
+.logo-icon{width:36px;height:36px;background:linear-gradient(135deg,#f4a261,#e94560);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:800;color:#fff}
+.logo h1{font-size:18px;font-weight:700;color:#e8ecf1}
+.logo small{font-size:11px;color:#555;display:block;margin-top:1px}
+.status-pill{display:flex;align-items:center;gap:8px;padding:6px 14px;border-radius:20px;font-size:12px;font-weight:600;border:1px solid}
+.status-pill.running{background:rgba(0,180,100,.08);border-color:rgba(0,180,100,.25);color:#00b464}
+.status-pill.stopped{background:rgba(100,100,120,.08);border-color:rgba(100,100,120,.25);color:#64647a}
+.status-pill.error{background:rgba(220,50,50,.08);border-color:rgba(220,50,50,.25);color:#dc3232}
+.status-dot{width:8px;height:8px;border-radius:50%}
+.running .status-dot{background:#00b464;animation:pulse 2s infinite}
+.stopped .status-dot{background:#64647a}
+.error .status-dot{background:#dc3232}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.container{max-width:900px;margin:0 auto;padding:20px}
+.card{background:linear-gradient(135deg,#12161f,#161c2a);border:1px solid rgba(255,255,255,.05);border-radius:14px;padding:20px;margin-bottom:16px}
+.card-title{font-size:13px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.stat-item{text-align:center;padding:12px 8px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.04);border-radius:10px}
+.stat-value{font-size:22px;font-weight:700}
+.stat-value.gold{color:#f4a261}
+.stat-value.green{color:#00b464}
+.stat-value.blue{color:#00b4d8}
+.stat-value.red{color:#e94560}
+.stat-label{font-size:11px;color:#555;margin-top:4px}
+.cookie-section{display:flex;gap:10px;align-items:flex-end}
+.form-group{flex:1}
+.form-group label{display:block;font-size:12px;color:#6b7280;margin-bottom:6px;font-weight:500}
+.form-group input{width:100%;padding:10px 14px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.08);border-radius:8px;color:#e8ecf1;font-size:13px;outline:none;font-family:monospace}
+.form-group input:focus{border-color:#00b4d8}
+.btn{padding:10px 20px;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s}
+.btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,.3)}
+.btn:active{transform:translateY(0)}
+.btn-primary{background:linear-gradient(135deg,#00b4d8,#0077b6);color:#fff}
+.btn-success{background:linear-gradient(135deg,#00b464,#008651);color:#fff}
+.btn-danger{background:linear-gradient(135deg,#dc3232,#a02020);color:#fff}
+.btn-warning{background:linear-gradient(135deg,#f4a261,#d4793a);color:#fff}
+.btn-outline{background:transparent;border:1px solid rgba(255,255,255,.12);color:#8892a4}
+.btn-outline:hover{border-color:rgba(255,255,255,.25);color:#c8cdd8}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+.log-container{background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.04);border-radius:10px;height:350px;overflow-y:auto;font-family:'JetBrains Mono','Fira Code',monospace;font-size:12px;padding:12px}
+.log-container::-webkit-scrollbar{width:6px}
+.log-container::-webkit-scrollbar-track{background:transparent}
+.log-container::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:3px}
+.log-entry{padding:3px 0;border-bottom:1px solid rgba(255,255,255,.02);display:flex;gap:10px}
+.log-time{color:#444;white-space:nowrap}
+.log-msg{flex:1;word-break:break-all}
+.log-msg.info{color:#8b95a8}
+.log-msg.debug{color:#555}
+.log-msg.warn{color:#f4a261}
+.log-msg.error{color:#e94560}
+.cookie-preview{font-size:11px;color:#00b464;padding:8px 12px;background:rgba(0,180,100,.05);border:1px solid rgba(0,180,100,.15);border-radius:8px;margin-top:10px;font-family:monospace}
+.no-cookie{font-size:11px;color:#dc3232;padding:8px 12px;background:rgba(220,50,50,.05);border:1px solid rgba(220,50,50,.15);border-radius:8px;margin-top:10px}
+@media(max-width:640px){
+  .stats-grid{grid-template-columns:repeat(2,1fr)}
+  .container{padding:12px}
+  .header{padding:12px 16px}
+  .controls{flex-direction:column}
+  .controls .btn{width:100%}
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">
+    <div class="logo-icon">C4</div>
+    <div>
+      <h1>C4Coins Faucet Bot</h1>
+      <small>feyorra.top &middot; Web Edition</small>
+    </div>
+  </div>
+  <div id="statusPill" class="status-pill stopped">
+    <div class="status-dot"></div>
+    <span id="statusText">Idle</span>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- Stats -->
+  <div class="card">
+    <div class="card-title">&#128202; Statistics</div>
+    <div class="stats-grid">
+      <div class="stat-item">
+        <div class="stat-value gold" id="earned">0.0000</div>
+        <div class="stat-label">Coins Earned</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-value green" id="claims">0</div>
+        <div class="stat-label">Claims</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-value blue" id="balance">N/A</div>
+        <div class="stat-label">Balance</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-value red" id="uptime">0s</div>
+        <div class="stat-label">Uptime</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Cookie -->
+  <div class="card">
+    <div class="card-title">&#127873; Cookie</div>
+    <div class="cookie-section">
+      <div class="form-group">
+        <label>ci_session cookie dari feyorra.top</label>
+        <input type="text" id="cookieInput" placeholder="Paste cookie di sini...">
+      </div>
+      <button class="btn btn-primary" onclick="saveCookie()">Save</button>
+    </div>
+    <div id="cookieStatus"></div>
+  </div>
+
+  <!-- Controls -->
+  <div class="card">
+    <div class="card-title">&#9881; Controls</div>
+    <div class="controls">
+      <button class="btn btn-success" id="btnStart" onclick="startBot()">&#9654; Start</button>
+      <button class="btn btn-danger" id="btnStop" onclick="stopBot()">&#9632; Stop</button>
+      <button class="btn btn-warning" id="btnPause" onclick="pauseBot()">&#10074;&#10074; Pause</button>
+      <button class="btn btn-outline" onclick="resetBot()">&#128260; Reset</button>
+    </div>
+  </div>
+
+  <!-- Extra Stats -->
+  <div class="card">
+    <div class="card-title">&#128200; Details</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px">
+      <div>Captcha Solved: <strong id="captchaOk" style="color:#00b464">0</strong></div>
+      <div>Captcha Failed: <strong id="captchaFail" style="color:#e94560">0</strong></div>
+      <div>Reconnects: <strong id="reconnects" style="color:#f4a261">0</strong></div>
+      <div>Last Claim: <strong id="lastClaim" style="color:#00b4d8">-</strong></div>
+    </div>
+  </div>
+
+  <!-- Logs -->
+  <div class="card" style="padding-bottom:8px">
+    <div class="card-title">&#128220; Activity Log</div>
+    <div class="log-container" id="logContainer">
+      <div style="color:#444;text-align:center;padding:40px">Menunggu log...</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const API = '';
+let lastLogCount = 0;
+
+async function api(path, opts) {
+  try {
+    const r = await fetch(API + path, opts);
+    return await r.json();
+  } catch(e) {
+    console.error(e);
+    return null;
+  }
+}
+
+async function updateStatus() {
+  const d = await api('/api/status');
+  if (!d) return;
+
+  // Status pill
+  const pill = document.getElementById('statusPill');
+  const pillText = document.getElementById('statusText');
+  pill.className = 'status-pill ' + (d.running && !d.paused ? 'running' : d.status.includes('rror') || d.status.includes('xpired') ? 'error' : 'stopped');
+  pillText.textContent = d.status;
+
+  // Stats
+  document.getElementById('earned').textContent = d.earned.toFixed(4);
+  document.getElementById('claims').textContent = d.claims;
+  document.getElementById('balance').textContent = d.balance;
+  document.getElementById('uptime').textContent = d.uptime;
+  document.getElementById('captchaOk').textContent = d.captcha_solves;
+  document.getElementById('captchaFail').textContent = d.captcha_fails;
+  document.getElementById('reconnects').textContent = d.connections_lost;
+  document.getElementById('lastClaim').textContent = d.last_time || '-';
+}
+
+async function updateLogs() {
+  const logs = await api('/api/logs');
+  if (!logs || !logs.length) return;
+
+  const container = document.getElementById('logContainer');
+
+  if (logs.length !== lastLogCount) {
+    lastLogCount = logs.length;
+    container.innerHTML = '';
+    logs.forEach(l => {
+      const div = document.createElement('div');
+      div.className = 'log-entry';
+      div.innerHTML = '<span class="log-time">' + l.time + '</span><span class="log-msg ' + l.level + '">' + escHtml(l.msg) + '</span>';
+      container.appendChild(div);
+    });
+    container.scrollTop = container.scrollHeight;
+  }
+}
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+async function loadCookieStatus() {
+  const d = await api('/api/cookie');
+  if (!d) return;
+  const el = document.getElementById('cookieStatus');
+  if (d.has_cookie) {
+    el.innerHTML = '<div class="cookie-preview">&#9989; Cookie aktif: ' + escHtml(d.cookie_preview) + '</div>';
+    document.getElementById('cookieInput').value = '';
+  } else {
+    el.innerHTML = '<div class="no-cookie">&#10060; Cookie belum di-set</div>';
+  }
+}
+
+async function saveCookie() {
+  const cookie = document.getElementById('cookieInput').value.trim();
+  if (!cookie) { alert('Cookie wajib diisi!'); return; }
+  const d = await api('/api/cookie', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({cookie})
+  });
+  if (d && d.ok) {
+    loadCookieStatus();
+    document.getElementById('cookieInput').value = '';
+  } else {
+    alert(d ? d.msg : 'Gagal save cookie');
+  }
+}
+
+async function startBot() {
+  const d = await api('/api/bot/start', {method:'POST'});
+  if (d && !d.ok) alert(d.msg);
+}
+
+async function stopBot() {
+  await api('/api/bot/stop', {method:'POST'});
+}
+
+async function pauseBot() {
+  await api('/api/bot/pause', {method:'POST'});
+}
+
+async function resetBot() {
+  if (!confirm('Reset semua data & cookie?')) return;
+  const d = await api('/api/bot/reset', {method:'POST'});
+  if (d && d.ok) {
+    loadCookieStatus();
+  }
+}
+
+// Polling
+setInterval(updateStatus, 1500);
+setInterval(updateLogs, 2000);
+updateStatus();
+updateLogs();
+loadCookieStatus();
+</script>
+</body>
+</html>
